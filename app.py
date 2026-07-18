@@ -1,6 +1,7 @@
 import os
 import re
 import time
+from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -14,13 +15,12 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 START_TIME = time.time()
 
-# 1. Regex bóc tách thẻ siêu chính xác cho mọi cấu trúc phân tách (|, ~, /,空格)
-# Định dạng: CARD [phân tách] MONTH [phân tách] YEAR [phân tách] CVV
+# 1. Regex bóc tách định dạng: CARD [phân tách] MONTH [phân tách] YEAR [phân tách] CVV
 CC_EXTRACT_REGEX = re.compile(
     r'\b(\d{13,19})[\s\-\/|~]+(0[1-9]|1[0-2])[\s\-\/|~]+(20\d{2}|\d{2})[\s\-\/|~]+(\d{3,4})\b'
 )
 
-# 2. Regex dự phòng cho trường hợp format ngược (YEAR rồi đến MONTH: YYYYMM)
+# 2. Regex dự phòng cho định dạng ngược (YEAR rồi đến MONTH: YYYYMM)
 CC_YYYYMM_REGEX = re.compile(
     r'\b(\d{13,19})[\s\-\/|~]+(20\d{2})(0[1-9]|1[0-2])[\s\-\/|~]+(\d{3,4})\b'
 )
@@ -45,51 +45,68 @@ def verify_luhn(card_number: str) -> bool:
 
 def process_text_cleaning(text: str) -> dict:
     start_time = time.time()
-    valid = set() # Dùng set để tự động loại bỏ trùng lặp (Tối ưu RAM)
+    extracted_cards = []
+    found_cards = set()
     
-    # Xử lý cắt dòng thông minh, loại bỏ rác trống trước khi chạy để tránh nuốt thẻ
+    # Cắt dòng và loại bỏ khoảng trắng rác
     lines = [line.strip() for line in text.splitlines() if len(line.strip()) >= 20]
     
     for line in lines:
-        # Cách 1: Quét bằng Regex chuẩn (Thả xích hoàn toàn cho cấu trúc dính liền User-Agent)
+        # Cách 1: Quét bằng Regex chuẩn phân tách ký tự
         match = CC_EXTRACT_REGEX.search(line)
         if match:
             card, mm, yy, cvv = match.groups()
-            # Chuẩn hóa năm về 2 chữ số (Ví dụ: 2025 -> 25)
             yy_short = yy[-2:]
-            if verify_luhn(card):
-                valid.add(f"{card}|{mm}|{yy_short}|{cvv}")
-                continue # Đã ăn được thẻ dòng này thì bỏ qua quét cách khác
+            if card not in found_cards and verify_luhn(card):
+                found_cards.add(card)
+                extracted_cards.append({'card': card, 'mm': mm, 'yy': yy_short, 'cvv': cvv})
+                continue
                 
         # Cách 2: Quét bằng format YYYYMM ngược
         match_ym = CC_YYYYMM_REGEX.search(line)
         if match_ym:
             card, yyyy, mm, cvv = match_ym.groups()
             yy_short = yyyy[-2:]
-            if verify_luhn(card):
-                valid.add(f"{card}|{mm}|{yy_short}|{cvv}")
+            if card not in found_cards and verify_luhn(card):
+                found_cards.add(card)
+                extracted_cards.append({'card': card, 'mm': mm, 'yy': yy_short, 'cvv': cvv})
                 continue
 
-        # Cách 3: Dự phòng cho cấu trúc nhãn cồng kềnh (card_number: ... secure_code: ...)
+        # Cách 3: Dự phòng cho cấu trúc có nhãn văn bản (card_number: ... secure_code: ...)
         if 'card_number:' in line.lower():
             card_match = re.search(r'card_number:\s*(\d{13,19})', line, re.IGNORECASE)
             if card_match:
                 card = card_match.group(1)
                 cvv_match = re.search(r'(?:secure_code|cvv|cvc):\s*(\d{3,4})', line, re.IGNORECASE)
                 exp_match = re.search(r'(?:expiration|exp):\s*(\d{2})\/(\d{2,4})', line, re.IGNORECASE)
-                if cvv_match and exp_match and verify_luhn(card):
+                if cvv_match and exp_match and card not in found_cards and verify_luhn(card):
                     mm = exp_match.group(1)
                     yy_short = exp_match.group(2)[-2:]
-                    valid.add(f"{card}|{mm}|{yy_short}|{cvv_match.group(1)}")
+                    found_cards.add(card)
+                    extracted_cards.append({'card': card, 'mm': mm, 'yy': yy_short, 'cvv': cvv_match.group(1)})
 
-    # Sắp xếp lại kết quả trả về
-    formatted_results = sorted(list(valid))
+    # --- BỘ LỌC KIỂM TRA HẾT HẠN THỜI GIAN THỰC ---
+    now = datetime.now()
+    current_year_short = now.year % 100
+    current_month = now.month
     
+    valid = []
+    for r in extracted_cards:
+        try:
+            exp_month = int(r['mm'])
+            exp_year = int(r['yy'])
+            # Chỉ giữ lại thẻ có hạn lớn hơn hoặc bằng tháng/năm hiện tại
+            if exp_year > current_year_short or (exp_year == current_year_short and exp_month >= current_month):
+                valid.append(f"{r['card']}|{r['mm']}|{r['yy']}|{r['cvv']}")
+        except ValueError:
+            continue
+
+    valid.sort()
     return {
         "success": True,
-        "count": len(formatted_results),
+        "count": len(valid),
         "processing_time_ms": int((time.time() - start_time) * 1000),
-        "data": formatted_results
+        "data": valid
     }
 
 @app.get('/health')
@@ -107,7 +124,7 @@ async def ccclean(
     
     if file:
         chunks = []
-        while chunk := await file.read(1024 * 1024): # Stream từng block 1MB chống sập RAM
+        while chunk := await file.read(1024 * 1024):  # Đọc tuần tự từng block 1MB bảo vệ RAM
             chunks.append(chunk.decode("utf-8", errors="ignore"))
         raw_text = "".join(chunks)
     elif text:
@@ -117,7 +134,7 @@ async def ccclean(
         body_bytes = b""
         async for chunk in request.stream():
             body_bytes += chunk
-            if len(body_bytes) > 52428800: # Giới hạn max 50MB
+            if len(body_bytes) > 52428800:  # Chặn payload vượt quá 50MB
                 raise HTTPException(status_code=413, detail="Payload Too Large (Max 50MB)")
                 
         raw_text = body_bytes.decode("utf-8", errors="ignore")
@@ -134,7 +151,7 @@ async def ccclean(
     if not raw_text:
         raise HTTPException(status_code=400, detail="Missing or invalid text body")
 
-    # Xử lý đa luồng ngầm hoàn toàn an toàn
+    # Đẩy tác vụ xử lý sang Thread Pool ngầm để duy trì Non-blocking
     result = process_text_cleaning(raw_text)
     return result
 
