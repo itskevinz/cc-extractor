@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +10,7 @@ import asyncio
 import os
 import time
 import re
-from typing import List, Dict, Any, Optional
+from typing import Optional
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────
 MAX_WORKERS = max(1, os.cpu_count() or 2)
@@ -20,7 +21,7 @@ SKIP_PREFIXES = frozenset([
     'order:', 'cc|month|year|cvv'
 ])
 YEAR_EXCLUSIONS = frozenset(str(y) for y in range(2020, 2040))
-MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "209715200"))  # 200MB default
 
 # ─── LUHN CHECK ─────────────────────────────────────────────────────────
 def verify_luhn(card_number: str) -> bool:
@@ -86,19 +87,17 @@ LINE_PATTERNS = [
     },
 ]
 
-# ─── WORKER FUNCTION (chạy trong Process) ──────────────────────────────
-def process_text(text: str) -> Dict[str, Any]:
+# ─── WORKER FUNCTION ────────────────────────────────────────────────────
+def process_text(text: str):
     start_time = time.time()
     all_results = []
     found_cards = set()
 
-    # ── Phase 1: Line-by-line matching ─────────────────────────────────
     lines = text.split('\n')
     for line in lines:
         trimmed = line.strip()
         if len(trimmed) < 20:
             continue
-
         if any(trimmed.lower().startswith(p) for p in SKIP_PREFIXES):
             continue
 
@@ -122,18 +121,13 @@ def process_text(text: str) -> Dict[str, Any]:
                 if block_end == -1:
                     block_end = len(text)
                 block = text[idx:block_end]
-
                 cvv_m = re.search(r'secure_code:\s*(\d{3,4})', block)
                 exp_m = re.search(r'expiration:\s*(\d{2})/(\d{2})', block)
-
                 if cvv_m and exp_m and card not in found_cards and verify_luhn(card):
                     found_cards.add(card)
-                    all_results.append({
-                        "card": card, "mm": exp_m.group(1), "yy": exp_m.group(2),
-                        "cvv": cvv_m.group(1), "source": "structured"
-                    })
+                    all_results.append({"card": card, "mm": exp_m.group(1), "yy": exp_m.group(2),
+                                        "cvv": cvv_m.group(1), "source": "structured"})
 
-    # ── Phase 2: Heuristic PAN matching ────────────────────────────────
     PAN_REGEX = re.compile(r'\b\d{13,19}\b')
     DATE_STRICT = re.compile(r'\b(0[1-9]|1[0-2])[\s\-/|]?(20\d{2}|\d{2})\b')
     DATE_YYYYMM = re.compile(r'\b(20\d{2})(0[1-9]|1[0-2])\b')
@@ -143,7 +137,6 @@ def process_text(text: str) -> Dict[str, Any]:
         card = m.group(0)
         if card in found_cards or not verify_luhn(card):
             continue
-
         p_start = m.start()
         space_start = max(0, p_start - 300)
         space_end = min(len(text), p_start + len(card) + 400)
@@ -152,14 +145,11 @@ def process_text(text: str) -> Dict[str, Any]:
 
         best_date = None
         min_date_dist = float('inf')
-
         for dm in DATE_STRICT.finditer(context):
             dist = abs((ctx_offset + dm.start()) - p_start)
             if dist < min_date_dist:
                 min_date_dist = dist
-                yy_part = dm.group(2)[-2:]
-                best_date = (dm.group(1), yy_part)
-
+                best_date = (dm.group(1), dm.group(2)[-2:])
         for dm in DATE_YYYYMM.finditer(context):
             dist = abs((ctx_offset + dm.start()) - p_start)
             if dist < min_date_dist:
@@ -171,21 +161,17 @@ def process_text(text: str) -> Dict[str, Any]:
 
         best_cvv = None
         min_cvv_dist = float('inf')
-
         for cm in CVV_REGEX.finditer(context):
             cvv_cand = cm.group(0)
             actual_start = ctx_offset + cm.start()
-
             if cvv_cand in card or cvv_cand in ''.join(best_date):
                 continue
             if cvv_cand in YEAR_EXCLUSIONS:
                 continue
-
             left_ok = actual_start == 0 or not text[actual_start - 1].isdigit()
             right_ok = actual_start + len(cvv_cand) >= len(text) or not text[actual_start + len(cvv_cand)].isdigit()
             if not (left_ok and right_ok):
                 continue
-
             dist = abs(actual_start - p_start)
             if dist < min_cvv_dist:
                 min_cvv_dist = dist
@@ -193,22 +179,15 @@ def process_text(text: str) -> Dict[str, Any]:
 
         if best_cvv:
             found_cards.add(card)
-            all_results.append({
-                "card": card, "mm": best_date[0], "yy": best_date[1],
-                "cvv": best_cvv, "source": "heuristic"
-            })
+            all_results.append({"card": card, "mm": best_date[0], "yy": best_date[1],
+                                "cvv": best_cvv, "source": "heuristic"})
 
-    # ── Phase 3: Lọc expired ───────────────────────────────────────────
     now = time.localtime()
     current_year_short = now.tm_year % 100
     current_month = now.tm_mon
-
-    valid = [
-        r for r in all_results
-        if int(r["yy"]) > current_year_short or
-           (int(r["yy"]) == current_year_short and int(r["mm"]) >= current_month)
-    ]
-
+    valid = [r for r in all_results
+             if int(r["yy"]) > current_year_short or
+                (int(r["yy"]) == current_year_short and int(r["mm"]) >= current_month)]
     formatted = sorted([f'{r["card"]}|{r["mm"]}|{r["yy"]}|{r["cvv"]}' for r in valid])
 
     return {
@@ -218,9 +197,20 @@ def process_text(text: str) -> Dict[str, Any]:
         "data": formatted
     }
 
+# ─── LIFESPAN (thay thế on_event) ──────────────────────────────────────
+executor = None
+START_TIME = time.time()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global executor
+    executor = ProcessPoolExecutor(max_workers=MAX_WORKERS)
+    yield
+    executor.shutdown(wait=True)
+
 # ─── FASTAPI APP ───────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="CCClean API", version="1.1.0")
+app = FastAPI(title="CCClean API", version="1.1.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
@@ -229,12 +219,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-executor = ProcessPoolExecutor(max_workers=MAX_WORKERS)
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    executor.shutdown(wait=True)
 
 @app.get("/health")
 async def health():
@@ -246,17 +230,10 @@ async def ccclean(
     request: Request,
     file: Optional[UploadFile] = File(None)
 ):
-    """
-    Nhận input theo 2 cách:
-    1. Upload file: multipart/form-data với field "file"
-    2. Raw text body: Content-Type: text/plain
-    """
     text = ""
     source = "body"
 
-    # Ưu tiên file upload
     if file is not None:
-        # Kiểm tra kích thước
         content = await file.read()
         if len(content) > MAX_FILE_SIZE:
             raise HTTPException(
@@ -266,19 +243,13 @@ async def ccclean(
         text = content.decode("utf-8", errors="ignore")
         source = f"file:{file.filename}"
     else:
-        # Fallback: đọc raw body
         body = await request.body()
         text = body.decode("utf-8", errors="ignore")
 
     if not text or not isinstance(text, str):
         raise HTTPException(status_code=400, detail="Missing or invalid text/file input")
 
-    # Chạy CPU-intensive trong process pool
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(executor, process_text, text)
     result["source"] = source
-
     return JSONResponse(content=result)
-
-# ─── STARTUP ──────────────────────────────────────────────────────────
-START_TIME = time.time()
