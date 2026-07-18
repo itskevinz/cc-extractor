@@ -2,17 +2,24 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const cluster = require('cluster');
 const os = require('os');
-const crypto = require('crypto');
 
 const app = express();
+
+// ─── Trust Proxy (BẮT BUỘC cho Render) ──────────────────────
+app.set('trust proxy', 1);
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.text({ limit: '50mb' }));
 
-// ─── Rate Limit ───────────────────────────────────────────────
+// ─── Rate Limit (skip validation cho proxy) ───────────────────
 const limiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 100,
-    message: { error: 'Too many requests', retryAfter: 60 }
+    max: 200,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.path === '/health',
+    // Tắt validation header vì Render dùng proxy
+    validate: { xForwardedForHeader: false }
 });
 app.use('/v1/', limiter);
 
@@ -34,13 +41,43 @@ function verifyLuhn(cardNumber) {
     return sum % 10 === 0;
 }
 
-// ─── Regex Patterns ───────────────────────────────────────────
+// ─── Regex Patterns (pre-compiled) ────────────────────────────
 const PAN_REGEX = /\b\d{13,19}\b/g;
 const CVV_REGEX = /\b\d{3,4}\b/g;
 const DATE_STRICT_REGEX = /\b(0[1-9]|1[0-2])[\s\-\/|]?(20\d{2}|\d{2})\b/g;
 const DATE_YYYYMM_REGEX = /\b(20\d{2})(0[1-9]|1[0-2])\b/g;
-
 const YEAR_EXCLUSIONS = new Set(Array.from({ length: 20 }, (_, i) => String(2020 + i)));
+
+// ─── Pre-compile line patterns ────────────────────────────────
+const LINE_PATTERNS = [
+    { regex: /^\d{13,19}\|\d{6}\|\d{3,4}\b/, type: 'format_yyyymm', extract: (m) => {
+        const parts = m[0].split('|');
+        return [parts[0], parts[1].slice(4, 6), parts[1].slice(2, 4), parts[2]];
+    }},
+    { regex: /^\d{13,19}\|\d{2}\/\d{2}\|\d{3,4}\b/, type: 'format_mm_slash_yy', extract: (m) => {
+        const parts = m[0].split('|');
+        const dateParts = parts[1].split('/');
+        return [parts[0], dateParts[0], dateParts[1], parts[2]];
+    }},
+    { regex: /^\d{13,19}~\d{2}\/\d{2}~\d{3,4}\b/, type: 'format_tilde', extract: (m) => {
+        const parts = m[0].split('~');
+        const dateParts = parts[1].split('/');
+        return [parts[0], dateParts[0], dateParts[1], parts[2]];
+    }},
+    { regex: /^\d{13,19}\|\d{2}\|\d{2}\|\d{3,4}\b/, type: 'format_pipe_mm_yy', extract: (m) => {
+        const parts = m[0].split('|');
+        return [parts[0], parts[1], parts[2], parts[3]];
+    }},
+    { regex: /^\d{13,19}\|\d{2}\/\d{2}\|\d{3,4}\|/, type: 'format_slovakia', extract: (m) => {
+        const parts = m[0].split('|');
+        const dateParts = parts[1].split('/');
+        return [parts[0], dateParts[0], dateParts[1], parts[2]];
+    }},
+];
+
+const SKIP_PREFIXES = ['country:', 'address:', 'scheme:', 'level:', 'bin:', 'secure_code:',
+    'type:', 'bank:', 'full_name:', 'dob:', 'phone_number:', 'expiration:',
+    'order:', 'cc|month|year|cvv'];
 
 // ─── Parse Line Formats ───────────────────────────────────────
 function parseLineFormats(text) {
@@ -50,21 +87,18 @@ function parseLineFormats(text) {
 
     for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed) continue;
-        if (/^(country:|address:|scheme:|level:|bin:|secure_code:|type:|bank:|full_name:|dob:|phone_number:|expiration:|order:|cc\|month\|year\|cvv)/.test(trimmed)) continue;
+        if (!trimmed || trimmed.length < 20) continue;
 
-        const patterns = [
-            { regex: /^(\d{13,19})\|(\d{6})\|(\d{3,4})\b/, type: 'format_yyyymm', handler: (m) => [m[1], m[2].slice(4, 6), m[2].slice(2, 4), m[3]] },
-            { regex: /^(\d{13,19})\|(\d{2})\/(\d{2})\|(\d{3,4})\b/, type: 'format_mm_slash_yy', handler: (m) => [m[1], m[2], m[3], m[4]] },
-            { regex: /^(\d{13,19})~(\d{2})\/(\d{2})~(\d{3,4})\b/, type: 'format_tilde', handler: (m) => [m[1], m[2], m[3], m[4]] },
-            { regex: /^(\d{13,19})\|(\d{2})\|(\d{2})\|(\d{3,4})\b/, type: 'format_pipe_mm_yy', handler: (m) => [m[1], m[2], m[3], m[4]] },
-            { regex: /^(\d{13,19})\|(\d{2})\/(\d{2})\|(\d{3,4})\|/, type: 'format_slovakia', handler: (m) => [m[1], m[2], m[3], m[4]] },
-        ];
+        let skip = false;
+        for (const prefix of SKIP_PREFIXES) {
+            if (trimmed.startsWith(prefix)) { skip = true; break; }
+        }
+        if (skip) continue;
 
-        for (const p of patterns) {
+        for (const p of LINE_PATTERNS) {
             const m = trimmed.match(p.regex);
             if (m) {
-                const [card, mm, yy, cvv] = p.handler(m);
+                const [card, mm, yy, cvv] = p.extract(m);
                 if (verifyLuhn(card) && !foundCards.has(card)) {
                     foundCards.add(card);
                     results.push({ card, mm, yy, cvv, source: p.type });
@@ -80,13 +114,20 @@ function parseLineFormats(text) {
 function parseStructured(text) {
     const results = [];
     const foundCards = new Set();
-    const pattern = /card_number:\s*(\d{13,19})\s*\n(?:[^\n]*\n)*?secure_code:\s*(\d{3,4})\s*\n(?:[^\n]*\n)*?expiration:\s*(\d{2})\/(\d{2})/g;
-    let m;
-    while ((m = pattern.exec(text)) !== null) {
-        const [card, cvv, mm, yy] = [m[1], m[2], m[3], m[4]];
-        if (verifyLuhn(card) && !foundCards.has(card)) {
+    // Tách block trước, rồi parse từng block
+    const blocks = text.split(/\n{2,}/);
+
+    for (const block of blocks) {
+        const cardMatch = block.match(/card_number:\s*(\d{13,19})/);
+        if (!cardMatch) continue;
+        const card = cardMatch[1];
+
+        const cvvMatch = block.match(/secure_code:\s*(\d{3,4})/);
+        const expMatch = block.match(/expiration:\s*(\d{2})\/(\d{2})/);
+
+        if (cvvMatch && expMatch && verifyLuhn(card) && !foundCards.has(card)) {
             foundCards.add(card);
-            results.push({ card, mm, yy, cvv, source: 'structured' });
+            results.push({ card, mm: expMatch[1], yy: expMatch[2], cvv: cvvMatch[1], source: 'structured' });
         }
     }
     return { results, foundCards };
@@ -96,6 +137,9 @@ function parseStructured(text) {
 function heuristicExtract(text, existingCards) {
     const results = [];
     const foundCards = new Set(existingCards);
+
+    // Reset regex global index
+    PAN_REGEX.lastIndex = 0;
     let m;
 
     while ((m = PAN_REGEX.exec(text)) !== null) {
@@ -216,12 +260,9 @@ function extractCC(text) {
 
 // ─── Chunk Processing for Large Input ─────────────────────────
 function processInChunks(text, chunkSize = 500000) {
-    const chunks = [];
-    for (let i = 0; i < text.length; i += chunkSize) {
-        chunks.push(text.slice(i, i + chunkSize));
-    }
     const allResults = new Set();
-    for (const chunk of chunks) {
+    for (let i = 0; i < text.length; i += chunkSize) {
+        const chunk = text.slice(i, i + chunkSize);
         const res = extractCC(chunk);
         res.forEach(r => allResults.add(r));
     }
