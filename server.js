@@ -4,8 +4,7 @@ const helmet = require('helmet');
 const cors = require('cors');
 const compression = require('compression');
 const NodeCache = require('node-cache');
-const { Worker } = require('worker_threads');
-const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,12 +13,12 @@ const PORT = process.env.PORT || 3000;
 app.use(helmet());
 app.use(cors());
 app.use(compression());
-app.use(express.json({ limit: '5mb' }));  // Giảm từ 10MB xuống 5MB
+app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
-// Rate limit: 60 requests / 1 phút (dễ test hơn)
+// Rate limit: 60 req/phút
 const limiter = rateLimit({
-  windowMs: 60 * 1000,  // 1 phút
+  windowMs: 60 * 1000,
   max: 60,
   message: { success: false, error: 'Too many requests', code: 'RATE_LIMIT' },
   standardHeaders: true,
@@ -31,58 +30,181 @@ app.use('/api/', limiter);
 // Cache: 10 phút
 const cache = new NodeCache({ stdTTL: 600, checkperiod: 120 });
 
-// Worker pool
-const MAX_WORKERS = 4;
-const workers = [];
-let workerIndex = 0;
-
-function getWorker() {
-  if (workers.length === 0) {
-    for (let i = 0; i < MAX_WORKERS; i++) {
-      workers.push(new Worker(path.resolve(__dirname, 'worker.js')));
+// ============ LUHN ============
+function luhnCheck(cardNumber) {
+  const len = cardNumber.length;
+  if (len < 13 || len > 19) return false;
+  let sum = 0;
+  let alternate = false;
+  for (let i = len - 1; i >= 0; i--) {
+    let n = parseInt(cardNumber[i], 10);
+    if (alternate) {
+      n *= 2;
+      if (n > 9) n -= 9;
     }
+    sum += n;
+    alternate = !alternate;
   }
-  const worker = workers[workerIndex];
-  workerIndex = (workerIndex + 1) % workers.length;
-  return worker;
+  return sum % 10 === 0;
 }
 
-function extractWithWorker(text) {
-  return new Promise((resolve, reject) => {
-    const worker = getWorker();
-    const timeout = setTimeout(() => {
-      reject(new Error('Worker timeout'));
-    }, 15000);  // 15 giây timeout
+// ============ EXTRACTOR ============
+function extract(text) {
+  const results = [];
+  const found = new Set();
+  const yearExclusions = new Set();
+  for (let y = 2020; y <= 2040; y++) yearExclusions.add(String(y));
 
-    worker.once('message', (result) => {
-      clearTimeout(timeout);
-      resolve(result);
-    });
+  const skipPrefixes = [
+    'country:', 'address:', 'scheme:', 'level:', 'bin:', 'secure_code:',
+    'type:', 'bank:', 'full_name:', 'dob:', 'phone_number:', 'expiration:',
+    'order:', 'cc|month|year|cvv'
+  ];
 
-    worker.once('error', (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
+  // Phase 1: Line formats
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const firstWord = trimmed.split(':')[0];
+    if (skipPrefixes.some(p => firstWord === p.replace(':', ''))) continue;
 
-    worker.postMessage({ text });
-  });
+    let m = trimmed.match(/^(\d{13,19})\|(\d{6})\|(\d{3,4})\b/);
+    if (m && luhnCheck(m[1]) && !found.has(m[1])) {
+      found.add(m[1]);
+      results.push([m[1], m[2].slice(4, 6), m[2].slice(2, 4), m[3], 'format_yyyymm']);
+      continue;
+    }
+
+    m = trimmed.match(/^(\d{13,19})\|(\d{2})\/(\d{2})\|(\d{3,4})\b/);
+    if (m && luhnCheck(m[1]) && !found.has(m[1])) {
+      found.add(m[1]);
+      results.push([m[1], m[2], m[3], m[4], 'format_mm_slash_yy']);
+      continue;
+    }
+
+    m = trimmed.match(/^(\d{13,19})\|(\d{2})\/(\d{2})\|(\d{3,4})\|/);
+    if (m && luhnCheck(m[1]) && !found.has(m[1])) {
+      found.add(m[1]);
+      results.push([m[1], m[2], m[3], m[4], 'format_slovakia']);
+      continue;
+    }
+
+    m = trimmed.match(/^(\d{13,19})~(\d{2})\/(\d{2})~(\d{3,4})\b/);
+    if (m && luhnCheck(m[1]) && !found.has(m[1])) {
+      found.add(m[1]);
+      results.push([m[1], m[2], m[3], m[4], 'format_tilde']);
+      continue;
+    }
+
+    m = trimmed.match(/^(\d{13,19})\|(\d{2})\|(\d{2})\|(\d{3,4})\b/);
+    if (m && luhnCheck(m[1]) && !found.has(m[1])) {
+      found.add(m[1]);
+      results.push([m[1], m[2], m[3], m[4], 'format_pipe_mm_yy']);
+    }
+  }
+
+  // Phase 2: Structured
+  const pattern = /card_number:\s*(\d{13,19})\s*\n(?:[^\n]*\n)*?secure_code:\s*(\d{3,4})\s*\n(?:[^\n]*\n)*?expiration:\s*(\d{2})\/(\d{2})/gi;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    if (luhnCheck(match[1]) && !found.has(match[1])) {
+      found.add(match[1]);
+      results.push([match[1], match[3], match[4], match[2], 'structured']);
+    }
+  }
+
+  // Phase 3: Heuristic (giới hạn context)
+  const textLen = text.length;
+  const panPattern = /\b\d{13,19}\b/g;
+  let panMatch;
+  while ((panMatch = panPattern.exec(text)) !== null) {
+    const card = panMatch[0];
+    if (found.has(card) || !luhnCheck(card)) continue;
+
+    const pStart = panMatch.index;
+    const ctxStart = Math.max(0, pStart - 200);
+    const ctxEnd = Math.min(textLen, pStart + card.length + 300);
+    const context = text.slice(ctxStart, ctxEnd);
+    const offset = ctxStart;
+
+    let bestDate = '';
+    let minDateScore = Infinity;
+
+    const datePattern = /\b(0[1-9]|1[0-2])[\s\-\/|]?(20\d{2}|\d{2})\b/g;
+    let dateMatch;
+    while ((dateMatch = datePattern.exec(context)) !== null) {
+      const dist = Math.abs((offset + dateMatch.index) - pStart);
+      if (dist < minDateScore) {
+        minDateScore = dist;
+        const yy = dateMatch[2];
+        bestDate = `${dateMatch[1]}|${yy.length === 4 ? yy.slice(2) : yy}`;
+      }
+    }
+
+    const yyyymmPattern = /\b(20\d{2})(0[1-9]|1[0-2])\b/g;
+    let yyyymmMatch;
+    while ((yyyymmMatch = yyyymmPattern.exec(context)) !== null) {
+      const dist = Math.abs((offset + yyyymmMatch.index) - pStart);
+      if (dist < minDateScore) {
+        minDateScore = dist;
+        bestDate = `${yyyymmMatch[2]}|${yyyymmMatch[1].slice(2)}`;
+      }
+    }
+
+    if (!bestDate) continue;
+
+    let bestCvv = '';
+    let minCvvScore = Infinity;
+    const cvvPattern = /\b\d{3,4}\b/g;
+    let cvvMatch;
+    while ((cvvMatch = cvvPattern.exec(context)) !== null) {
+      const cvv = cvvMatch[0];
+      const pos = offset + cvvMatch.index;
+      if (card.includes(cvv) || bestDate.replace('|', '').includes(cvv)) continue;
+      if (yearExclusions.has(cvv)) continue;
+      const left = pos - 1;
+      const right = pos + cvv.length;
+      if ((left >= 0 && /\d/.test(text[left])) || (right < textLen && /\d/.test(text[right]))) continue;
+      const dist = Math.abs(pos - pStart);
+      if (dist < minCvvScore) {
+        minCvvScore = dist;
+        bestCvv = cvv;
+      }
+    }
+
+    if (bestCvv) {
+      const [m, y] = bestDate.split('|');
+      results.push([card, m, y, bestCvv, 'heuristic']);
+      found.add(card);
+    }
+  }
+
+  // Filter expired
+  const now = new Date();
+  const curYear = now.getFullYear() % 100;
+  const curMonth = now.getMonth() + 1;
+  const valid = [];
+  for (const row of results) {
+    const ey = parseInt(row[2], 10);
+    const em = parseInt(row[1], 10);
+    if (ey < curYear || (ey === curYear && em < curMonth)) continue;
+    valid.push(`${row[0]}|${row[1]}|${row[2]}|${row[3]}`);
+  }
+  valid.sort();
+  return valid;
 }
 
 // ============ ROUTES ============
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    uptime: process.uptime(), 
-    workers: workers.length,
-    timestamp: new Date().toISOString() 
-  });
+  res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
 });
 
 app.get('/api/extract', (req, res) => {
   res.json({ status: 'API running', method: 'GET', try: 'POST /api/extract' });
 });
 
-app.post('/api/extract', async (req, res) => {
+app.post('/api/extract', (req, res) => {
   const start = Date.now();
 
   const text = req.body.text || req.body.data || '';
@@ -91,12 +213,10 @@ app.post('/api/extract', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Missing text', code: 'MISSING_INPUT' });
   }
 
-  // Giới hạn input
   if (text.length > 5 * 1024 * 1024) {
     return res.status(413).json({ success: false, error: 'Max 5MB', code: 'TOO_LARGE' });
   }
 
-  // Giới hạn số dòng (tránh DoS)
   const lineCount = text.split('\n').length;
   if (lineCount > 10000) {
     return res.status(413).json({ success: false, error: 'Max 10000 lines', code: 'TOO_MANY_LINES' });
@@ -104,7 +224,7 @@ app.post('/api/extract', async (req, res) => {
 
   try {
     // Check cache
-    const cacheKey = `extract_${require('crypto').createHash('md5').update(text).digest('hex')}`;
+    const cacheKey = `extract_${crypto.createHash('md5').update(text).digest('hex')}`;
     const cached = cache.get(cacheKey);
     if (cached) {
       return res.json({
@@ -120,10 +240,7 @@ app.post('/api/extract', async (req, res) => {
       });
     }
 
-    // Extract trong worker thread
-    const results = await extractWithWorker(text);
-
-    // Save cache
+    const results = extract(text);
     cache.set(cacheKey, results);
 
     res.json({
@@ -152,14 +269,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ success: false, error: 'Internal error', code: 'SERVER_ERROR' });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  workers.forEach(w => w.terminate());
-  process.exit(0);
-});
-
 app.listen(PORT, () => {
   console.log(`🚀 Card Extract API running on port ${PORT}`);
-  console.log(`📡 Health: http://localhost:${PORT}/health`);
-  console.log(`📡 API: http://localhost:${PORT}/api/extract`);
 });
