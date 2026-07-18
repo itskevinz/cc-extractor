@@ -15,98 +15,143 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 START_TIME = time.time()
 
-# 1. Regex bóc tách định dạng: CARD [phân tách] MONTH [phân tách] YEAR [phân tách] CVV
-CC_EXTRACT_REGEX = re.compile(
-    r'\b(\d{13,19})[\s\-\/|~]+(0[1-9]|1[0-2])[\s\-\/|~]+(20\d{2}|\d{2})[\s\-\/|~]+(\d{3,4})\b'
-)
+class HybridCardExtractor:
+    def __init__(self):
+        self.patterns = []
+        self._load_default_patterns()
+        current_date = datetime.now()
+        self.current_year = current_date.year
+        self.current_month = current_date.month
 
-# 2. Regex dự phòng cho định dạng ngược (YEAR rồi đến MONTH: YYYYMM)
-CC_YYYYMM_REGEX = re.compile(
-    r'\b(\d{13,19})[\s\-\/|~]+(20\d{2})(0[1-9]|1[0-2])[\s\-\/|~]+(\d{3,4})\b'
-)
+    def _load_default_patterns(self):
+        self.patterns = [
+            re.compile(r"(\d{13,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})"),
+            re.compile(r"CCNUM\s*(\d{13,19})\s*EXP\s*(\d{1,2})/(\d{2,4})\s*CVV\s*(\d{3,4})"),
+            re.compile(r"(\d{13,19})::(\d{1,2})::(\d{2,4})::(\d{3,4})"),
+            re.compile(r"(\d{13,19})\s+.*?\s+(\d{2})(\d{2,4})\s+(\d{3})"),
+            re.compile(r"(\d{13,19})\n(\d{2})/(\d{2,4})\n(\d{3})"),
+            re.compile(r"Number:\s*(\d{13,19})\s*Expiry:\s*(\d{2})/(\d{2,4})\s*CVV:\s*(\d{3})"),
+            re.compile(r"(\d{13,19})\s+(\d{1,2})\s+(\d{2,4})\s+(\d{3})"),
+            re.compile(r"(\d{13,19})----(\d{1,2})----(\d{2,4})----(\d{3,4})"),
+            re.compile(r".*?\|\d\|.*?\|(\d{13,19})\|(\d{2})(\d{2,4})\|(\d{3,4})"),
+            re.compile(r".*?\|.*?\|.*?\|(\d{13,19})\|(\d{2})(\d{2,4})\|(\d{3,4})"),
+            re.compile(r"CC:\s*(\d{13,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})"),
+            re.compile(r"'card_num':\s*'(\d{13,19})',.*?'expiry_date':\s*'(\d{2})(\d{2,4})',.*?'cvv':\s*'(\d{3,4})'"),
+            re.compile(r"(\d{13,19})\s(\d{2})\s(\d{2,4})\s(\d{3})\s"),
+            re.compile(r"(\d{13,19})\|(\d{2})/(\d{2,4})\|(\d{3,4})"),
+            re.compile(r"(\d{13,19})\|(\d{2})\|(\d{2,4})\|(\d{3,4})"),
+            re.compile(r"Number:\s*(\d{13,19})\s*Expiry:\s*(\d{2})/(\d{2,4})\s*CVV:\s*(\d{3})\s*Name:\s*.*?\s*Address:\s*.*?\s*City:\s*.*?\s*State:\s*.*?\s*ZIP:\s*.*?\s*Country:\s*.*?\s*Phone:\s*.*?\s*Email:\s*.*?\s*IP:\s*.*?\s*Browser:\s*.*?"),
+            re.compile(r"(\d{13,19})\s+(\d{2})/(\d{2,4})\s+(\d{3,4})\s+.*?\s+.*?\s+.*?\s+.*?\s+.*?\s+.*?\s+.*?\s+.*?\s+.*?\s+.*?")
+        ]
 
-def verify_luhn(card_number: str) -> bool:
-    digits = [int(c) for c in card_number if '0' <= c <= '9']
-    length = len(digits)
-    if length < 13 or length > 19:
-        return False
-    
-    total = 0
-    alternate = False
-    for i in range(length - 1, -1, -1):
-        n = digits[i]
-        if alternate:
-            n *= 2
-            if n > 9:
-                n -= 9
-        total += n
-        alternate = not alternate
-    return total % 10 == 0
+    def _is_luhn_valid(self, card_number):
+        try:
+            digits = [int(d) for d in card_number]
+            odd_digits = digits[-1::-2]
+            even_digits = digits[-2::-2]
+            checksum = sum(odd_digits)
+            for d in even_digits:
+                checksum += sum(divmod(d * 2, 10))
+            return checksum % 10 == 0
+        except Exception:
+            return False
+
+    def _is_not_expired(self, month_str, year_str):
+        try:
+            m = int(month_str)
+            y = int(year_str)
+            if len(year_str) == 2:
+                y += 2000
+            if not (1 <= m <= 12):
+                return False
+            if y < self.current_year:
+                return False
+            if y == self.current_year and m < self.current_month:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _pure_fallback(self, text):
+        tokens = re.findall(r'\d+', text)
+        if not tokens:
+            return None
+        pan = next((t for t in tokens if 13 <= len(t) <= 19), None)
+        if not pan:
+            return None
+        tokens.remove(pan)
+        cvv = next((t for t in reversed(tokens) if len(t) in [3, 4]), None)
+        if cvv:
+            tokens.remove(cvv)
+        month, year = None, None
+        for t in tokens:
+            if len(t) == 6:
+                if 1 <= int(t[4:]) <= 12:
+                    year, month = t[:4], t[4:]
+                    break
+                elif 1 <= int(t[:2]) <= 12:
+                    month, year = t[:2], t[2:]
+                    break
+            elif len(t) == 4 and 1 <= int(t[:2]) <= 12:
+                month, year = t[:2], "20" + t[2:]
+                break
+        if not month or not year:
+            year_tok = next((t for t in tokens if len(t) == 4 and int(t) >= 2020), None)
+            if year_tok:
+                year = year_tok
+                tokens.remove(year_tok)
+            month_tok = next((t for t in tokens if len(t) in [1, 2] and 1 <= int(t) <= 12), None)
+            if month_tok:
+                month = month_tok
+                tokens.remove(month_tok)
+            if not year:
+                year_tok = next((t for t in tokens if len(t) == 2), None)
+                if year_tok:
+                    year = "20" + year_tok
+        if pan and month and year and cvv:
+            return pan, month.zfill(2), year, cvv
+        return None
+
+    def extract(self, raw_text):
+        cleaned = set()
+        for line in raw_text.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            matched = False
+            for pattern in self.patterns:
+                m = pattern.search(line)
+                if m:
+                    groups = m.groups()
+                    if len(groups) == 4:
+                        pan, month, year, cvv = groups
+                        if len(year) == 2:
+                            year = "20" + year
+                        if self._is_luhn_valid(pan) and self._is_not_expired(month, year):
+                            cleaned.add(f"{pan}|{month.zfill(2)}|{year[-2:]}|{cvv}")
+                        matched = True
+                        break
+            if not matched:
+                fallback = self._pure_fallback(line)
+                if fallback:
+                    pan, month, year, cvv = fallback
+                    if len(year) == 2:
+                        year = "20" + year
+                    if self._is_luhn_valid(pan) and self._is_not_expired(month, year):
+                        cleaned.add(f"{pan}|{month.zfill(2)}|{year[-2:]}|{cvv}")
+        return sorted(list(cleaned))
+
+extractor = HybridCardExtractor()
 
 def process_text_cleaning(text: str) -> dict:
     start_time = time.time()
-    extracted_cards = []
-    found_cards = set()
+    valid_cards = extractor.extract(text)
     
-    # Cắt dòng và loại bỏ khoảng trắng rác
-    lines = [line.strip() for line in text.splitlines() if len(line.strip()) >= 20]
-    
-    for line in lines:
-        # Cách 1: Quét bằng Regex chuẩn phân tách ký tự
-        match = CC_EXTRACT_REGEX.search(line)
-        if match:
-            card, mm, yy, cvv = match.groups()
-            yy_short = yy[-2:]
-            if card not in found_cards and verify_luhn(card):
-                found_cards.add(card)
-                extracted_cards.append({'card': card, 'mm': mm, 'yy': yy_short, 'cvv': cvv})
-                continue
-                
-        # Cách 2: Quét bằng format YYYYMM ngược
-        match_ym = CC_YYYYMM_REGEX.search(line)
-        if match_ym:
-            card, yyyy, mm, cvv = match_ym.groups()
-            yy_short = yyyy[-2:]
-            if card not in found_cards and verify_luhn(card):
-                found_cards.add(card)
-                extracted_cards.append({'card': card, 'mm': mm, 'yy': yy_short, 'cvv': cvv})
-                continue
-
-        # Cách 3: Dự phòng cho cấu trúc có nhãn văn bản (card_number: ... secure_code: ...)
-        if 'card_number:' in line.lower():
-            card_match = re.search(r'card_number:\s*(\d{13,19})', line, re.IGNORECASE)
-            if card_match:
-                card = card_match.group(1)
-                cvv_match = re.search(r'(?:secure_code|cvv|cvc):\s*(\d{3,4})', line, re.IGNORECASE)
-                exp_match = re.search(r'(?:expiration|exp):\s*(\d{2})\/(\d{2,4})', line, re.IGNORECASE)
-                if cvv_match and exp_match and card not in found_cards and verify_luhn(card):
-                    mm = exp_match.group(1)
-                    yy_short = exp_match.group(2)[-2:]
-                    found_cards.add(card)
-                    extracted_cards.append({'card': card, 'mm': mm, 'yy': yy_short, 'cvv': cvv_match.group(1)})
-
-    # --- BỘ LỌC KIỂM TRA HẾT HẠN THỜI GIAN THỰC ---
-    now = datetime.now()
-    current_year_short = now.year % 100
-    current_month = now.month
-    
-    valid = []
-    for r in extracted_cards:
-        try:
-            exp_month = int(r['mm'])
-            exp_year = int(r['yy'])
-            # Chỉ giữ lại thẻ có hạn lớn hơn hoặc bằng tháng/năm hiện tại
-            if exp_year > current_year_short or (exp_year == current_year_short and exp_month >= current_month):
-                valid.append(f"{r['card']}|{r['mm']}|{r['yy']}|{r['cvv']}")
-        except ValueError:
-            continue
-
-    valid.sort()
     return {
         "success": True,
-        "count": len(valid),
+        "count": len(valid_cards),
         "processing_time_ms": int((time.time() - start_time) * 1000),
-        "data": valid
+        "data": valid_cards
     }
 
 @app.get('/health')
@@ -124,7 +169,7 @@ async def ccclean(
     
     if file:
         chunks = []
-        while chunk := await file.read(1024 * 1024):  # Đọc tuần tự từng block 1MB bảo vệ RAM
+        while chunk := await file.read(1024 * 1024):
             chunks.append(chunk.decode("utf-8", errors="ignore"))
         raw_text = "".join(chunks)
     elif text:
@@ -134,7 +179,7 @@ async def ccclean(
         body_bytes = b""
         async for chunk in request.stream():
             body_bytes += chunk
-            if len(body_bytes) > 52428800:  # Chặn payload vượt quá 50MB
+            if len(body_bytes) > 52428800:
                 raise HTTPException(status_code=413, detail="Payload Too Large (Max 50MB)")
                 
         raw_text = body_bytes.decode("utf-8", errors="ignore")
@@ -151,7 +196,6 @@ async def ccclean(
     if not raw_text:
         raise HTTPException(status_code=400, detail="Missing or invalid text body")
 
-    # Đẩy tác vụ xử lý sang Thread Pool ngầm để duy trì Non-blocking
     result = process_text_cleaning(raw_text)
     return result
 
