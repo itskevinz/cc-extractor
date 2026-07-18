@@ -1,6 +1,5 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
-const cluster = require('cluster');
 const os = require('os');
 
 const app = express();
@@ -11,17 +10,15 @@ app.set('trust proxy', 1);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.text({ limit: '50mb' }));
 
-// ─── Rate Limit (skip validation cho proxy) ───────────────────
+// ─── Rate Limit ───────────────────────────────────────────────
 const limiter = rateLimit({
     windowMs: 60 * 1000,
     max: 200,
     standardHeaders: true,
     legacyHeaders: false,
     skip: (req) => req.path === '/health',
-    // Tắt validation header vì Render dùng proxy
     validate: { xForwardedForHeader: false }
 });
-app.use('/v1/', limiter);
 
 // ─── Luhn Check ───────────────────────────────────────────────
 function verifyLuhn(cardNumber) {
@@ -41,14 +38,13 @@ function verifyLuhn(cardNumber) {
     return sum % 10 === 0;
 }
 
-// ─── Regex Patterns (pre-compiled) ────────────────────────────
+// ─── Regex Patterns ───────────────────────────────────────────
 const PAN_REGEX = /\b\d{13,19}\b/g;
 const CVV_REGEX = /\b\d{3,4}\b/g;
 const DATE_STRICT_REGEX = /\b(0[1-9]|1[0-2])[\s\-\/|]?(20\d{2}|\d{2})\b/g;
 const DATE_YYYYMM_REGEX = /\b(20\d{2})(0[1-9]|1[0-2])\b/g;
 const YEAR_EXCLUSIONS = new Set(Array.from({ length: 20 }, (_, i) => String(2020 + i)));
 
-// ─── Pre-compile line patterns ────────────────────────────────
 const LINE_PATTERNS = [
     { regex: /^\d{13,19}\|\d{6}\|\d{3,4}\b/, type: 'format_yyyymm', extract: (m) => {
         const parts = m[0].split('|');
@@ -114,7 +110,6 @@ function parseLineFormats(text) {
 function parseStructured(text) {
     const results = [];
     const foundCards = new Set();
-    // Tách block trước, rồi parse từng block
     const blocks = text.split(/\n{2,}/);
 
     for (const block of blocks) {
@@ -138,7 +133,6 @@ function heuristicExtract(text, existingCards) {
     const results = [];
     const foundCards = new Set(existingCards);
 
-    // Reset regex global index
     PAN_REGEX.lastIndex = 0;
     let m;
 
@@ -258,7 +252,7 @@ function extractCC(text) {
     return valid.map(r => `${r.card}|${r.mm}|${r.yy}|${r.cvv}`).sort();
 }
 
-// ─── Chunk Processing for Large Input ─────────────────────────
+// ─── Chunk Processing ─────────────────────────────────────────
 function processInChunks(text, chunkSize = 500000) {
     const allResults = new Set();
     for (let i = 0; i < text.length; i += chunkSize) {
@@ -269,8 +263,17 @@ function processInChunks(text, chunkSize = 500000) {
     return Array.from(allResults).sort();
 }
 
-// ─── API Endpoint ─────────────────────────────────────────────
-app.post('/v1/ccclean', (req, res) => {
+// ═══════════════════════════════════════════════════════════════
+// ROUTES
+// ═══════════════════════════════════════════════════════════════
+
+// Health check (KHÔNG qua rate limit)
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', uptime: process.uptime(), workers: 1 });
+});
+
+// Main API endpoint
+app.post('/v1/ccclean', limiter, (req, res) => {
     const startTime = Date.now();
     const text = req.body?.text || req.body;
 
@@ -290,27 +293,19 @@ app.post('/v1/ccclean', (req, res) => {
     });
 });
 
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime(), workers: os.cpus().length });
+// 404 handler
+app.use((req, res) => {
+    res.status(404).json({ error: 'Not found', path: req.path, method: req.method });
 });
 
-// ─── Cluster Mode for High Load ───────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// START SERVER - Single instance (Render Free = 1 worker)
+// ═══════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 
-if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
-    const numCPUs = os.cpus().length;
-    console.log(`Primary ${process.pid} starting ${numCPUs} workers...`);
-    for (let i = 0; i < numCPUs; i++) {
-        cluster.fork();
-    }
-    cluster.on('exit', (worker) => {
-        console.log(`Worker ${worker.process.pid} died, restarting...`);
-        cluster.fork();
-    });
-} else {
-    app.listen(PORT, () => {
-        console.log(`Server running on port ${PORT} (PID: ${process.pid})`);
-    });
-}
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT} (PID: ${process.pid})`);
+    console.log(`Routes: GET /health, POST /v1/ccclean`);
+});
 
 module.exports = app;
