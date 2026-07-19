@@ -25,6 +25,23 @@ class HybridCardExtractor:
 
     def _load_default_patterns(self):
         self.patterns = [
+            # === PATTERN MỚI: Dạng Australia ===
+            # PAN Name YYYYMM CVV [email] [Country]
+            # Ví dụ: 4596930012599858 HolderName 202804 848  AUSTRALIA
+            # YYYYMM = 4 số năm + 2 số tháng
+            re.compile(r"(\d{13,19})\s+\S+\s+(\d{4})(\d{2})\s+(\d{3,4})"),
+            
+            # === PATTERN MỚI: Dạng Taiwan ===
+            # PAN|YYYYMM|CVV|TYPE|BANK|CREDIT|LEVEL|COUNTRY
+            # Ví dụ: 5241150365343509|202907|437|MASTERCARD|BANK SINOPAC|CREDIT|TITANIUM|TW
+            re.compile(r"(\d{13,19})\|(\d{4})(\d{2})\|(\d{3,4})\|"),
+            
+            # === PATTERN MỚI: Dạng Switzerland ===
+            # PAN|MM/YY|CVV|Name|Address|...
+            # Ví dụ: 5487190090873639|02/25|773|Vitorovic Goran|Altrheinweg 94|...
+            re.compile(r"(\d{13,19})\|(\d{2})/(\d{2,4})\|(\d{3,4})\|"),
+            
+            # === CÁC PATTERN CŨ ===
             re.compile(r"(\d{13,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})"),
             re.compile(r"CCNUM\s*(\d{13,19})\s*EXP\s*(\d{1,2})/(\d{2,4})\s*CVV\s*(\d{3,4})"),
             re.compile(r"(\d{13,19})::(\d{1,2})::(\d{2,4})::(\d{3,4})"),
