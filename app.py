@@ -117,6 +117,8 @@ class SuperCardExtractor:
             (r'(\d{13,19})\s+(\d{1,2})\s+(\d{4})\s+(\d{3,4})', lambda m: (m.group(1), m.group(2).zfill(2), m.group(3), m.group(4))),
             (r'.*?\|\d\|.*?\|(\d{13,19})\|(\d{2})(\d{2,4})\|(\d{3,4})', lambda m: (m.group(1), m.group(2).zfill(2), m.group(3), m.group(4))),
             (r'CC:\s*(\d{13,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})', lambda m: (m.group(1), m.group(2).zfill(2), m.group(3), m.group(4))),
+            (r'[⇻↬↫✅❌]\s*CC\s*[:：]\s*(\d{13,19})\s*[\|｜]\s*(\d{1,2})\s*[\|｜]\s*(\d{4})\s*[\|｜]\s*(\d{3,4})', lambda m: (m.group(1), m.group(2).zfill(2), m.group(3), m.group(4))),
+            (r'[⇻↬↫✅❌]\s*CC\s*[:：]\s*(\d{13,19})\s*[\|｜]\s*(\d{1,2})\s*[\|｜]\s*(\d{2})\s*[\|｜]\s*(\d{3,4})', lambda m: (m.group(1), m.group(2).zfill(2), '20' + m.group(3), m.group(4))),
         ]
         for pat, extr in old:
             patterns.append((re.compile(pat, re.I), extr))
@@ -143,7 +145,12 @@ class SuperCardExtractor:
         return patterns
 
     def _normalize_text(self, text):
-        text = text.translate(self._FW_MAP)
+        if not text:
+            return ""
+        text = re.sub(r'[\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e\ufeff\u2060]', '', text)
+        text = html.unescape(text)
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'[*_~`]', '', text)
         text = re.sub(r'[⌁∶：﹕｡．‥…．。･・•・∙⋅]', ':', text)
         text = re.sub(r'[～∼〜﹋﹌]', '~', text)
         text = re.sub(r'[／]', '/', text)
