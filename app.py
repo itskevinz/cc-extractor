@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import html
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
